@@ -1,0 +1,633 @@
+
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#f5f5f5">
+<title>卡牌批次裁切工具 V1</title>
+
+<style>
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  padding: 20px;
+  font-family: -apple-system, BlinkMacSystemFont, sans-serif;
+  background: #f5f5f5;
+  color: #222;
+}
+
+main {
+  max-width: 600px;
+  margin: auto;
+}
+
+.panel {
+  background: white;
+  padding: 16px;
+  border-radius: 14px;
+  margin-bottom: 16px;
+}
+
+button {
+  width: 100%;
+  padding: 14px;
+  border: 0;
+  border-radius: 10px;
+  background: #222;
+  color: white;
+  font-size: 16px;
+  font-weight: 600;
+  margin-top: 10px;
+}
+
+button:disabled {
+  opacity: .4;
+}
+
+input {
+  font: inherit;
+}
+
+input[type=file],
+input[type=range] {
+  width: 100%;
+  margin: 12px 0;
+}
+
+.muted {
+  color: #777;
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+progress {
+  width: 100%;
+  height: 16px;
+  margin-top: 12px;
+}
+
+.preview {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  gap: 10px;
+}
+
+.item {
+  background: #eee;
+  border-radius: 10px;
+  overflow: hidden;
+  font-size: 12px;
+}
+
+.item img {
+  display: block;
+  width: 100%;
+  aspect-ratio: 3 / 4;
+  object-fit: contain;
+}
+
+.item div {
+  padding: 8px;
+  overflow-wrap: anywhere;
+}
+
+#status {
+  white-space: pre-wrap;
+  font-size: 13px;
+  line-height: 1.6;
+  margin-top: 12px;
+}
+</style>
+</head>
+
+<body>
+<main>
+
+<h1>卡牌批次裁切工具</h1>
+<p class="muted">V1 測試版｜照片只在目前裝置本機處理，不會上傳。</p>
+
+<section class="panel">
+  <h3>1. 選擇照片</h3>
+  <input id="files" type="file" accept="image/*" multiple>
+  <div id="fileInfo" class="muted">尚未選擇照片</div>
+  <div id="preview" class="preview"></div>
+</section>
+
+<section class="panel">
+  <h3>2. 卡牌佔比設定</h3>
+
+  <label>
+    卡牌寬度佔輸出圖片比例：
+    <strong id="ratioLabel">70%</strong>
+  </label>
+
+  <input id="ratio" type="range" min="40" max="90" value="70">
+
+  <p class="muted">
+    例如 70% 代表卡牌寬度約佔輸出圖片的 70%。
+  </p>
+</section>
+
+<section class="panel">
+  <h3>3. 批次處理</h3>
+
+  <button id="start" disabled>開始裁切</button>
+
+  <progress id="progress" value="0" max="100"></progress>
+
+  <div id="status">正在等待 OpenCV 載入...</div>
+
+  <button id="download" disabled>下載 ZIP</button>
+</section>
+
+</main>
+
+<script>
+window.Module = {
+  onRuntimeInitialized() {
+    cvReady = true;
+    updateStartButton();
+    setStatus('OpenCV 載入完成，可以選擇照片。');
+    console.log('OpenCV Runtime 初始化完成');
+  }
+};
+</script>
+<script src="./libs/opencv.js"></script>
+<script src="./libs/jszip.min.js"></script>
+
+<script>
+'use strict';
+
+const $ = id => document.getElementById(id);
+
+const OUTPUT_W = 1200;
+const OUTPUT_H = 1600;
+
+let selectedFiles = [];
+let previewURLs = [];
+let zipBlob = null;
+let cvReady = false;
+let processing = false;
+
+/* =========================
+   OpenCV 初始化
+========================= */
+
+async function initOpenCV() {
+  try {
+    let instance = window.cv;
+
+    if (instance && typeof instance.then === 'function') {
+      instance = await instance;
+      window.cv = instance;
+    }
+
+    if (!instance || typeof instance.Mat !== 'function') {
+      throw new Error('找不到 OpenCV Mat');
+    }
+
+    cvReady = true;
+
+    updateStartButton();
+
+    setStatus('OpenCV 載入完成，可以選擇照片。');
+
+    console.log('OpenCV 初始化成功');
+
+  } catch (error) {
+    cvReady = false;
+
+    setStatus('OpenCV 載入失敗：' + error.message);
+
+    console.error(error);
+  }
+}
+
+function setStatus(message) {
+  $('status').textContent = message;
+}
+
+/* =========================
+   照片選擇與預覽
+========================= */
+
+function clearPreview() {
+  previewURLs.forEach(url => URL.revokeObjectURL(url));
+  previewURLs = [];
+
+  $('preview').innerHTML = '';
+}
+
+function updateStartButton() {
+  $('start').disabled =
+    !cvReady || !window.JSZip || selectedFiles.length === 0 || processing;
+}
+
+$('ratio').addEventListener('input', () => {
+  $('ratioLabel').textContent = $('ratio').value + '%';
+});
+
+$('files').addEventListener('change', event => {
+  clearPreview();
+
+  selectedFiles = Array.from(event.target.files || []);
+
+  zipBlob = null;
+
+  $('download').disabled = true;
+
+  $('fileInfo').textContent =
+    `已選擇 ${selectedFiles.length} 張照片`;
+
+  selectedFiles.slice(0, 4).forEach(file => {
+    const url = URL.createObjectURL(file);
+
+    previewURLs.push(url);
+
+    const item = document.createElement('div');
+    item.className = 'item';
+
+    const img = document.createElement('img');
+    img.src = url;
+
+    const label = document.createElement('div');
+    label.textContent = file.name;
+
+    item.append(img, label);
+
+    $('preview').appendChild(item);
+  });
+
+  if (selectedFiles.length > 4) {
+    const more = document.createElement('p');
+    more.className = 'muted';
+    more.textContent = `另外還有 ${selectedFiles.length - 4} 張照片`;
+    $('preview').appendChild(more);
+  }
+
+  updateStartButton();
+});
+
+/* =========================
+   載入圖片
+========================= */
+
+function loadImage(file) {
+  return new Promise((resolve, reject) => {
+    const url = URL.createObjectURL(file);
+    const img = new Image();
+
+    img.onload = () => {
+      URL.revokeObjectURL(url);
+      resolve(img);
+    };
+
+    img.onerror = () => {
+      URL.revokeObjectURL(url);
+      reject(new Error('圖片讀取失敗'));
+    };
+
+    img.src = url;
+  });
+}
+
+/* =========================
+   OpenCV 卡牌矩形偵測
+========================= */
+
+
+function getCardContour(canvas) {
+  const src = cv.imread(canvas);
+
+  const hsv = new cv.Mat();
+  const mask = new cv.Mat();
+  const closed = new cv.Mat();
+
+  const contours = new cv.MatVector();
+  const hierarchy = new cv.Mat();
+
+  const kernel = cv.getStructuringElement(
+    cv.MORPH_RECT,
+    new cv.Size(15, 15)
+  );
+
+  let best = null;
+  let bestArea = 0;
+
+  try {
+    // 轉換 HSV 色彩空間
+    cv.cvtColor(src, hsv, cv.COLOR_RGB2HSV);
+
+    // 篩選有一定飽和度的區域，排除白色背景
+    const lower = new cv.Mat(
+      hsv.rows,
+      hsv.cols,
+      hsv.type(),
+      new cv.Scalar(0, 25, 70, 0)
+    );
+
+    const upper = new cv.Mat(
+      hsv.rows,
+      hsv.cols,
+      hsv.type(),
+      new cv.Scalar(180, 255, 255, 255)
+    );
+
+    cv.inRange(hsv, lower, upper, mask);
+
+    lower.delete();
+    upper.delete();
+
+    // 閉運算：連接卡牌內部斷裂的色彩區域
+    cv.morphologyEx(
+      mask,
+      closed,
+      cv.MORPH_CLOSE,
+      kernel
+    );
+
+    // 只找最外層輪廓
+    cv.findContours(
+      closed,
+      contours,
+      hierarchy,
+      cv.RETR_EXTERNAL,
+      cv.CHAIN_APPROX_SIMPLE
+    );
+
+    const imageArea = src.cols * src.rows;
+
+    for (let i = 0; i < contours.size(); i++) {
+      const contour = contours.get(i);
+
+      try {
+        const rect = cv.boundingRect(contour);
+
+        const area = rect.width * rect.height;
+        const aspect = rect.width / rect.height;
+
+        if (
+          area > imageArea * 0.03 &&
+          aspect > 0.55 &&
+          aspect < 0.82 &&
+          area > bestArea
+        ) {
+          bestArea = area;
+
+          best = {
+            x: rect.x,
+            y: rect.y,
+            width: rect.width,
+            height: rect.height
+          };
+        }
+
+      } finally {
+        contour.delete();
+      }
+    }
+
+  } finally {
+    src.delete();
+    hsv.delete();
+    mask.delete();
+    closed.delete();
+    contours.delete();
+    hierarchy.delete();
+    kernel.delete();
+  }
+
+  return best;
+}
+
+/* =========================
+   單張圖片裁切
+========================= */
+
+async function processOne(file) {
+  const img = await loadImage(file);
+
+  let canvas = null;
+  let output = null;
+
+  try {
+    canvas = document.createElement('canvas');
+
+    canvas.width = img.naturalWidth;
+    canvas.height = img.naturalHeight;
+
+    const ctx = canvas.getContext('2d');
+
+    ctx.drawImage(img, 0, 0);
+
+    const rect = getCardContour(canvas);
+
+    if (!rect) {
+      return {
+        success: false,
+        reason: '找不到符合條件的卡牌矩形'
+      };
+    }
+
+    const targetRatio = Number($('ratio').value) / 100;
+
+    const targetCardWidth = OUTPUT_W * targetRatio;
+
+    const scale = targetCardWidth / rect.width;
+
+    const sourceW = OUTPUT_W / scale;
+    const sourceH = OUTPUT_H / scale;
+
+    const centerX = rect.x + rect.width / 2;
+    const centerY = rect.y + rect.height / 2;
+
+    const sx = centerX - sourceW / 2;
+    const sy = centerY - sourceH / 2;
+
+    if (
+      sx < 0 ||
+      sy < 0 ||
+      sx + sourceW > canvas.width ||
+      sy + sourceH > canvas.height
+    ) {
+      return {
+        success: false,
+        reason: '照片周圍留白不足'
+      };
+    }
+
+    output = document.createElement('canvas');
+
+    output.width = OUTPUT_W;
+    output.height = OUTPUT_H;
+
+    output.getContext('2d').drawImage(
+      canvas,
+      sx,
+      sy,
+      sourceW,
+      sourceH,
+      0,
+      0,
+      OUTPUT_W,
+      OUTPUT_H
+    );
+
+    const blob = await new Promise(resolve => {
+      output.toBlob(resolve, 'image/jpeg', 0.92);
+    });
+
+    if (!blob) {
+      return {
+        success: false,
+        reason: 'JPEG 輸出失敗'
+      };
+    }
+
+    return {
+      success: true,
+      blob
+    };
+
+  } finally {
+    img.src = '';
+
+    if (canvas) {
+      canvas.width = 0;
+      canvas.height = 0;
+    }
+
+    if (output) {
+      output.width = 0;
+      output.height = 0;
+    }
+  }
+}
+
+/* =========================
+   批次處理
+========================= */
+
+$('start').addEventListener('click', async () => {
+  if (processing || !cvReady || !selectedFiles.length) return;
+
+  processing = true;
+
+  updateStartButton();
+
+  $('download').disabled = true;
+
+  $('progress').value = 0;
+
+  zipBlob = null;
+
+  const zip = new JSZip();
+
+  const failures = [];
+
+  let successCount = 0;
+
+  try {
+    for (let i = 0; i < selectedFiles.length; i++) {
+      const file = selectedFiles[i];
+
+      setStatus(
+        `正在處理 ${i + 1} / ${selectedFiles.length}\n${file.name}`
+      );
+
+      try {
+        const result = await processOne(file);
+
+        if (result.success) {
+          const name = file.name.replace(/\.[^.]+$/, '');
+
+          zip.file(`${name}_裁切.jpg`, result.blob);
+
+          successCount++;
+
+        } else {
+          failures.push(`${file.name}：${result.reason}`);
+        }
+
+      } catch (error) {
+        failures.push(`${file.name}：${error.message}`);
+
+        console.error(error);
+      }
+
+      $('progress').value =
+        ((i + 1) / selectedFiles.length) * 100;
+
+      // 讓瀏覽器有機會更新畫面
+      await new Promise(resolve => setTimeout(resolve, 20));
+    }
+
+    if (successCount > 0) {
+      setStatus('正在打包 ZIP...');
+
+      zipBlob = await zip.generateAsync({
+        type: 'blob'
+      });
+
+      $('download').disabled = false;
+    }
+
+    setStatus(
+      `處理完成！\n` +
+      `成功：${successCount} 張\n` +
+      `失敗：${failures.length} 張\n\n` +
+      (failures.length ? failures.join('\n') : '全部成功')
+    );
+
+  } catch (error) {
+    setStatus('批次處理發生錯誤：' + error.message);
+
+    console.error(error);
+
+  } finally {
+    processing = false;
+
+    updateStartButton();
+  }
+});
+
+/* =========================
+   ZIP 下載
+========================= */
+
+$('download').addEventListener('click', () => {
+  if (!zipBlob) return;
+
+  const url = URL.createObjectURL(zipBlob);
+
+  const a = document.createElement('a');
+
+  a.href = url;
+  a.download = '卡牌裁切結果.zip';
+
+  a.click();
+
+  setTimeout(() => {
+    URL.revokeObjectURL(url);
+  }, 3000);
+});
+
+/* =========================
+   Service Worker
+========================= */
+
+if (
+  'serviceWorker' in navigator &&
+  location.protocol.startsWith('http')
+) {
+  navigator.serviceWorker.register('./sw.js')
+    .catch(error => {
+      console.error('Service Worker 註冊失敗：', error);
+    });
+}
+
+</script>
+</body>
+</html>
