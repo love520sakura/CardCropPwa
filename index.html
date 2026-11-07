@@ -123,7 +123,7 @@ progress {
     <strong id="ratioLabel">70%</strong>
   </label>
 
-  <input id="ratio" type="range" min="40" max="90" value="70">
+  <input type="range" id="ratio" min="40" max="90" value="70">
 
   <p class="muted">
     例如 70% 代表卡牌寬度約佔輸出圖片的 70%。
@@ -293,67 +293,181 @@ function loadImage(file) {
   });
 }
 
-/* =========================
-   OpenCV 卡牌矩形偵測
-========================= */
 
-
-function getCardContour(canvas) {
+function normalizeCardOrientation(canvas) {
   const src = cv.imread(canvas);
-
-  const hsv = new cv.Mat();
-  const mask = new cv.Mat();
+  const gray = new cv.Mat();
+  const blurred = new cv.Mat();
+  const edges = new cv.Mat();
   const closed = new cv.Mat();
-
   const contours = new cv.MatVector();
   const hierarchy = new cv.Mat();
 
   const kernel = cv.getStructuringElement(
     cv.MORPH_RECT,
-    new cv.Size(15, 15)
+    new cv.Size(9, 9)
   );
 
-  let best = null;
-  let bestArea = 0;
+  try {
+    cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY);
+
+    cv.GaussianBlur(
+      gray, blurred, new cv.Size(5, 5), 0
+    );
+
+    cv.Canny(blurred, edges, 15, 45);
+
+    cv.morphologyEx(
+      edges, closed, cv.MORPH_CLOSE, kernel
+    );
+
+    cv.findContours(
+      closed, contours, hierarchy,
+      cv.RETR_LIST, cv.CHAIN_APPROX_SIMPLE
+    );
+
+    const imageArea = src.cols * src.rows;
+    const candidates = [];
+
+    for (let i = 0; i < contours.size(); i++) {
+      const contour = contours.get(i);
+
+      try {
+        const rect = cv.boundingRect(contour);
+        const area = rect.width * rect.height;
+        const aspect = rect.width / rect.height;
+
+        if (area < imageArea * 0.08) continue;
+
+        const isPortrait =
+          aspect >= 0.55 && aspect <= 0.90;
+
+        const isLandscape =
+          aspect >= 1.10 && aspect <= 1.85;
+
+        if (!isPortrait && !isLandscape) continue;
+
+        const rectangularity =
+          cv.contourArea(contour) / area;
+
+        if (
+          rectangularity < 0.55 &&
+          area < imageArea * 0.35
+        ) continue;
+
+        candidates.push({
+          ...rect,
+          area,
+          rectangularity,
+          orientation: isLandscape
+            ? 'landscape'
+            : 'portrait'
+        });
+
+      } finally {
+        contour.delete();
+      }
+    }
+
+    if (!candidates.length) {
+      return {
+        canvas,
+        rotated: false,
+        orientation: 'unknown'
+      };
+    }
+
+    candidates.sort((a, b) => b.area - a.area);
+
+    const best = candidates[0];
+
+    console.log('方向辨識：', best);
+
+    if (best.orientation === 'portrait') {
+      return {
+        canvas,
+        rotated: false,
+        orientation: 'portrait'
+      };
+    }
+
+    // 橫式：順時針旋轉 90 度
+    // 適用於掛耳位於左側的照片
+    const rotatedCanvas = document.createElement('canvas');
+
+    rotatedCanvas.width = canvas.height;
+    rotatedCanvas.height = canvas.width;
+
+    const ctx = rotatedCanvas.getContext('2d');
+
+    ctx.translate(rotatedCanvas.width, 0);
+    ctx.rotate(Math.PI / 2);
+    ctx.drawImage(canvas, 0, 0);
+
+    return {
+      canvas: rotatedCanvas,
+      rotated: true,
+      orientation: 'landscape'
+    };
+
+  } finally {
+    src.delete();
+    gray.delete();
+    blurred.delete();
+    edges.delete();
+    closed.delete();
+    contours.delete();
+    hierarchy.delete();
+    kernel.delete();
+  }
+}
+
+/* =========================
+   OpenCV 卡牌矩形偵測
+========================= */
+
+function getCardContour(canvas) {
+  const src = cv.imread(canvas);
+  const gray = new cv.Mat();
+  const blurred = new cv.Mat();
+  const edges = new cv.Mat();
+  const closed = new cv.Mat();
+  const contours = new cv.MatVector();
+  const hierarchy = new cv.Mat();
+
+  const kernel = cv.getStructuringElement(
+    cv.MORPH_RECT,
+    new cv.Size(9, 9)
+  );
+
+  const candidates = [];
 
   try {
-    // 轉換 HSV 色彩空間
-    cv.cvtColor(src, hsv, cv.COLOR_RGB2HSV);
+    // 1. 影像前處理
+    cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY);
 
-    // 篩選有一定飽和度的區域，排除白色背景
-    const lower = new cv.Mat(
-      hsv.rows,
-      hsv.cols,
-      hsv.type(),
-      new cv.Scalar(0, 25, 70, 0)
+    cv.GaussianBlur(
+      gray,
+      blurred,
+      new cv.Size(5, 5),
+      0
     );
 
-    const upper = new cv.Mat(
-      hsv.rows,
-      hsv.cols,
-      hsv.type(),
-      new cv.Scalar(180, 255, 255, 255)
-    );
+    cv.Canny(blurred, edges, 15, 45);
 
-    cv.inRange(hsv, lower, upper, mask);
-
-    lower.delete();
-    upper.delete();
-
-    // 閉運算：連接卡牌內部斷裂的色彩區域
     cv.morphologyEx(
-      mask,
+      edges,
       closed,
       cv.MORPH_CLOSE,
       kernel
     );
 
-    // 只找最外層輪廓
+    // 2. 尋找輪廓
     cv.findContours(
       closed,
       contours,
       hierarchy,
-      cv.RETR_EXTERNAL,
+      cv.RETR_LIST,
       cv.CHAIN_APPROX_SIMPLE
     );
 
@@ -365,64 +479,278 @@ function getCardContour(canvas) {
       try {
         const rect = cv.boundingRect(contour);
 
-        const area = rect.width * rect.height;
+        const boxArea = rect.width * rect.height;
         const aspect = rect.width / rect.height;
 
+        // 排除太小或比例不合理的輪廓
         if (
-          area > imageArea * 0.03 &&
-          aspect > 0.55 &&
-          aspect < 0.82 &&
-          area > bestArea
+          boxArea < imageArea * 0.08 ||
+          aspect < 0.55 ||
+          aspect > 0.90
         ) {
-          bestArea = area;
-
-          best = {
-            x: rect.x,
-            y: rect.y,
-            width: rect.width,
-            height: rect.height
-          };
+          continue;
         }
+
+        const contourArea = cv.contourArea(contour);
+        const rectangularity = contourArea / boxArea;
+
+        // 完整矩形可通過；
+        // 大型不完整輪廓也保留供保護套辨識
+        if (
+          rectangularity < 0.55 &&
+          boxArea < imageArea * 0.35
+        ) {
+          continue;
+        }
+
+        candidates.push({
+          x: rect.x,
+          y: rect.y,
+          width: rect.width,
+          height: rect.height,
+          area: boxArea,
+          rectangularity
+        });
 
       } finally {
         contour.delete();
       }
     }
 
+    // 3. 沒有候選框
+    if (candidates.length === 0) {
+      console.log('找不到商品候選矩形');
+      return null;
+    }
+
+    // 4. 先依面積排序
+    candidates.sort((a, b) => b.area - a.area);
+
+    console.table(
+      candidates.slice(0, 10).map(c => ({
+        x: c.x,
+        y: c.y,
+        width: c.width,
+        height: c.height,
+        rectangularity:
+          c.rectangularity.toFixed(3)
+      }))
+    );
+
+    // 5. 以最大候選框為基礎
+    const largest = candidates[0];
+
+    // 找出左右邊界接近的候選框
+    const related = candidates.filter(c => {
+      const leftDiff = Math.abs(
+        c.x - largest.x
+      );
+
+      const rightDiff = Math.abs(
+        (c.x + c.width) -
+        (largest.x + largest.width)
+      );
+
+      return (
+        leftDiff < largest.width * 0.08 &&
+        rightDiff < largest.width * 0.08
+      );
+    });
+
+    // 6. 合併相關候選框
+    const left = Math.min(
+      ...related.map(c => c.x)
+    );
+
+    const right = Math.max(
+      ...related.map(c => c.x + c.width)
+    );
+
+    const candidateBottom = Math.max(
+      ...related.map(c => c.y + c.height)
+    );
+
+    const searchBottom = Math.min(
+      ...related.map(c => c.y)
+    );
+
+    // 7. 搜尋上方水平邊緣
+    const topEdges = [];
+
+    const scanLeft = Math.max(
+      0,
+      Math.round(
+        left + (right - left) * 0.1
+      )
+    );
+
+    const scanRight = Math.min(
+      edges.cols,
+      Math.round(
+        right - (right - left) * 0.1
+      )
+    );
+
+    for (let y = 0; y < searchBottom; y += 2) {
+      let count = 0;
+
+      for (
+        let x = scanLeft;
+        x < scanRight;
+        x += 2
+      ) {
+        if (edges.ucharPtr(y, x)[0] > 0) {
+          count++;
+        }
+      }
+
+      topEdges.push({ y, count });
+    }
+
+    topEdges.sort(
+      (a, b) => b.count - a.count
+    );
+
+    console.table(topEdges.slice(0, 10));
+
+    // 8. 修正商品主體上緣
+    let top = searchBottom;
+
+    const strongest = topEdges[0]?.count || 0;
+
+    const detectedTop = topEdges.find(edge =>
+      edge.y > canvas.height * 0.05 &&
+      edge.y < searchBottom - largest.height * 0.05 &&
+      edge.count >= strongest * 0.60 &&
+      edge.count >= 20
+    )?.y;
+
+    if (detectedTop !== undefined) {
+      const gap = searchBottom - detectedTop;
+
+      if (
+        gap > largest.height * 0.03 &&
+        gap < largest.height * 0.20
+      ) {
+        top = detectedTop;
+      }
+    }
+
+    // 9. 組合最終矩形
+    const result = {
+      x: Math.round(left),
+      y: Math.round(top),
+      width: Math.round(right - left),
+      height: Math.round(candidateBottom - top)
+    };
+
+    console.log('合併後商品主體：', result);
+    console.log('相關候選框數量：', related.length);
+
+    return result;
+
   } finally {
+    // 10. 釋放 OpenCV 記憶體
     src.delete();
-    hsv.delete();
-    mask.delete();
+    gray.delete();
+    blurred.delete();
+    edges.delete();
     closed.delete();
     contours.delete();
     hierarchy.delete();
     kernel.delete();
   }
-
-  return best;
 }
 
 /* =========================
    單張圖片裁切
 ========================= */
 
+
 async function processOne(file) {
   const img = await loadImage(file);
 
   let canvas = null;
+  let rotatedCanvas = null;
   let output = null;
+  let landscapeCanvas = null;
 
   try {
+    // 1. 建立原始照片 Canvas
     canvas = document.createElement('canvas');
-
     canvas.width = img.naturalWidth;
     canvas.height = img.naturalHeight;
 
-    const ctx = canvas.getContext('2d');
+    const originalCtx = canvas.getContext('2d');
+    originalCtx.drawImage(img, 0, 0);
 
-    ctx.drawImage(img, 0, 0);
+    // 2. 自動判斷方向
+    const normalized = normalizeCardOrientation(canvas);
 
-    const rect = getCardContour(canvas);
+    console.log('方向判斷結果：', {
+      orientation: normalized.orientation,
+      rotated: normalized.rotated
+    });
+
+    if (normalized.orientation === 'unknown') {
+      return {
+        success: false,
+        reason: '無法判斷卡牌方向'
+      };
+    }
+
+    const workCanvas = normalized.canvas;
+
+    // 記錄額外建立的旋轉 Canvas
+    if (normalized.rotated) {
+      rotatedCanvas = workCanvas;
+    }
+
+    // 3. 辨識商品主體
+    const rect = getCardContour(workCanvas);
+    
+    if (rect) {
+      const debugCanvas = document.createElement('canvas');
+
+      debugCanvas.width = workCanvas.width;
+      debugCanvas.height = workCanvas.height;
+
+      const debugCtx = debugCanvas.getContext('2d');
+
+      // 畫出原始照片（橫式照片會先轉成直式）
+      debugCtx.drawImage(workCanvas, 0, 0);
+
+      // 畫出商品主體辨識框
+      debugCtx.strokeStyle = 'red';
+      debugCtx.lineWidth = 8;
+
+      debugCtx.strokeRect(
+        rect.x,
+        rect.y,
+        rect.width,
+        rect.height
+      );
+
+      // 顯示除錯圖片
+      const debugImage = new Image();
+
+      debugImage.src = debugCanvas.toDataURL('image/jpeg', 0.9);
+      debugImage.style.maxWidth = '100%';
+      debugImage.style.height = 'auto';
+
+      document.body.appendChild(debugImage);
+
+      // 釋放暫存 Canvas
+      debugCanvas.width = 0;
+      debugCanvas.height = 0;
+    }
+
+    console.log('工作圖片尺寸：',
+      workCanvas.width,
+      workCanvas.height
+    );
+
+    console.log('偵測到的商品主體：', rect);
 
     if (!rect) {
       return {
@@ -431,11 +759,26 @@ async function processOne(file) {
       };
     }
 
+    // 4. 讀取商品佔比
     const targetRatio = Number($('ratio').value) / 100;
 
-    const targetCardWidth = OUTPUT_W * targetRatio;
+    if (
+      !Number.isFinite(targetRatio) ||
+      targetRatio <= 0 ||
+      targetRatio > 1
+    ) {
+      return {
+        success: false,
+        reason: '商品佔比設定不正確'
+      };
+    }
 
-    const scale = targetCardWidth / rect.width;
+    // 5. C 模式：
+    // 商品主體寬度與高度都不超過設定佔比
+    const scale = Math.min(
+      (OUTPUT_W * targetRatio) / rect.width,
+      (OUTPUT_H * targetRatio) / rect.height
+    );
 
     const sourceW = OUTPUT_W / scale;
     const sourceH = OUTPUT_H / scale;
@@ -443,28 +786,105 @@ async function processOne(file) {
     const centerX = rect.x + rect.width / 2;
     const centerY = rect.y + rect.height / 2;
 
-    const sx = centerX - sourceW / 2;
-    const sy = centerY - sourceH / 2;
+    console.log('裁切比例檢查：', {
+      設定佔比: targetRatio * 100 + '%',
+      實際寬度佔比:
+        (rect.width * scale / OUTPUT_W * 100).toFixed(2) + '%',
+      實際高度佔比:
+        (rect.height * scale / OUTPUT_H * 100).toFixed(2) + '%',
+      裁切來源寬度: sourceW,
+      裁切來源高度: sourceH
+    });
+
+    // 6. 確認原圖背景足夠
+    const EPS = 0.001;
 
     if (
-      sx < 0 ||
-      sy < 0 ||
-      sx + sourceW > canvas.width ||
-      sy + sourceH > canvas.height
+      sourceW > workCanvas.width + EPS ||
+      sourceH > workCanvas.height + EPS
     ) {
       return {
         success: false,
-        reason: '照片周圍留白不足'
+        reason: '裁切範圍大於原始照片，背景留白不足'
       };
     }
 
-    output = document.createElement('canvas');
+    if (
+      rect.width > sourceW + EPS ||
+      rect.height > sourceH + EPS
+    ) {
+      return {
+        success: false,
+        reason: '設定佔比過大，無法完整保留商品主體'
+      };
+    }
 
+    // 7. 計算允許的裁切位置
+    // 確保商品主體不會被裁掉
+    const minX = Math.max(
+      0,
+      rect.x + rect.width - sourceW
+    );
+
+    const maxX = Math.min(
+      rect.x,
+      workCanvas.width - sourceW
+    );
+
+    const minY = Math.max(
+      0,
+      rect.y + rect.height - sourceH
+    );
+
+    const maxY = Math.min(
+      rect.y,
+      workCanvas.height - sourceH
+    );
+
+    if (
+      minX > maxX + EPS ||
+      minY > maxY + EPS
+    ) {
+      return {
+        success: false,
+        reason: '照片周圍留白不足，無法完整保留商品主體'
+      };
+    }
+
+    // 8. 優先置中，必要時微調裁切框
+    const sx = Math.max(
+      minX,
+      Math.min(centerX - sourceW / 2, maxX)
+    );
+
+    const sy = Math.max(
+      minY,
+      Math.min(centerY - sourceH / 2, maxY)
+    );
+
+    console.log('裁切位置檢查：', {
+      sx,
+      sy,
+      sourceW,
+      sourceH,
+      原圖寬度: workCanvas.width,
+      原圖高度: workCanvas.height,
+      商品中心X: centerX,
+      商品中心Y: centerY
+    });
+
+    // 9. 先產生直式裁切圖片
+    output = document.createElement('canvas');
     output.width = OUTPUT_W;
     output.height = OUTPUT_H;
 
-    output.getContext('2d').drawImage(
-      canvas,
+    const outputCtx = output.getContext('2d');
+
+    outputCtx.imageSmoothingEnabled = true;
+    outputCtx.imageSmoothingQuality = 'high';
+
+    outputCtx.drawImage(
+      workCanvas,
       sx,
       sy,
       sourceW,
@@ -475,8 +895,41 @@ async function processOne(file) {
       OUTPUT_H
     );
 
+    // 10. 原本是橫式卡牌：
+    // 將直式裁切結果逆時針旋轉 90 度
+    if (normalized.rotated) {
+      landscapeCanvas = document.createElement('canvas');
+      landscapeCanvas.width = OUTPUT_H;
+      landscapeCanvas.height = OUTPUT_W;
+
+      const landscapeCtx =
+        landscapeCanvas.getContext('2d');
+
+      landscapeCtx.translate(
+        0,
+        landscapeCanvas.height
+      );
+
+      landscapeCtx.rotate(-Math.PI / 2);
+
+      landscapeCtx.drawImage(output, 0, 0);
+
+      // 後續以橫式 Canvas 輸出
+      const oldOutput = output;
+      output = landscapeCanvas;
+      landscapeCanvas = null;
+
+      oldOutput.width = 0;
+      oldOutput.height = 0;
+    }
+
+    // 11. 轉成 JPEG
     const blob = await new Promise(resolve => {
-      output.toBlob(resolve, 'image/jpeg', 0.92);
+      output.toBlob(
+        resolve,
+        'image/jpeg',
+        0.92
+      );
     });
 
     if (!blob) {
@@ -486,12 +939,27 @@ async function processOne(file) {
       };
     }
 
+    console.log('輸出完成：', {
+      width: output.width,
+      height: output.height,
+      rotated: normalized.rotated
+    });
+
     return {
       success: true,
       blob
     };
 
+  } catch (error) {
+    console.error('圖片處理失敗：', error);
+
+    return {
+      success: false,
+      reason: error?.message || '圖片處理發生未知錯誤'
+    };
+
   } finally {
+    // 12. 釋放記憶體
     img.src = '';
 
     if (canvas) {
@@ -499,9 +967,19 @@ async function processOne(file) {
       canvas.height = 0;
     }
 
+    if (rotatedCanvas) {
+      rotatedCanvas.width = 0;
+      rotatedCanvas.height = 0;
+    }
+
     if (output) {
       output.width = 0;
       output.height = 0;
+    }
+
+    if (landscapeCanvas) {
+      landscapeCanvas.width = 0;
+      landscapeCanvas.height = 0;
     }
   }
 }
